@@ -1,0 +1,8 @@
+cd "/Users/wenxuanzhang/Desktop/移动/anydoc文件夹解析工具"
+.venv/bin/python batch_parse_folders.py "/需要解析的总文件夹"
+
+python3 main.py batch \
+  --item DJ-03 \
+  --dataset-dir "/Users/wenxuanzhang/Desktop/文档解析/网管中心/批量解析结果" \      
+  --output-dir "/Users/wenxuanzhang/Desktop/稽核代码2/output/DJ-03_完整测试集" \
+  --overwrite

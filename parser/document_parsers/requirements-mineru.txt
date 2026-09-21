@@ -1,0 +1,3 @@
+# Optional high-accuracy backend. Official package requires substantial local
+# disk/model space; install only when PDF-only report/assessment fallback is needed.
+mineru[all]>=3.4,<4

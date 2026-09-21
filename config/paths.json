@@ -1,0 +1,9 @@
+{
+  "evaluation_root": "评估集20",
+  "default_output_root": "output",
+  "sample_source_root": "智能体案例",
+  "soffice_candidates": [
+    "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+  ],
+  "mineru_url": "http://127.0.0.1:18001/file_parse"
+}

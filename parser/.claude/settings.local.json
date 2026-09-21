@@ -1,0 +1,6 @@
+{
+  "enabledMcpjsonServers": [
+    "brave_search",
+    "grok"
+  ]
+}

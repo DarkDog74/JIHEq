@@ -1,0 +1,49 @@
+# ============ 密钥：绝不允许入库 ============
+# secrets.env_副本 / _副本2 是真实密钥，旧配置只写了 secrets.env 漏掉了它们
+secrets.env*
+!secrets.env.example
+*.env
+!*.env.example
+
+# ============ 跑批产物与平台状态 ============
+# 注意：output/单系统/.state/model_config.json 里存着明文 API Key
+output/
+release/
+
+# ============ 评测原始数据（含甲方系统材料，勿入库）============
+评估集201/
+
+# ============ 客户材料：不纳入版本库 ============
+# docs/qq 为某系统的真实稽核结果（资产清单、备案信息、稽核结论及证据原文）
+docs/qq/
+# 由 label 工作簿生成的标注实例
+reference_data/ground_truth.v1.json
+模型稽核指标对比.xlsx
+
+# ============ 虚拟环境 ============
+.venv/
+.venv_旧环境_*/
+venv/
+env/
+
+# ============ 前端 ============
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/*.tsbuildinfo
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============ 系统与临时文件 ============
+.DS_Store
+Thumbs.db
+.~*
+~$*
+*.log

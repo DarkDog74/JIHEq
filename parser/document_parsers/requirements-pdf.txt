@@ -1,0 +1,7 @@
+# Local PDF fallback shared by the seven-category parsers.
+pdfplumber>=0.11,<1
+opencv-python-headless>=4.10,<5
+rapidocr>=3.4,<4
+onnxruntime>=1.18,<2
+numpy>=1.26,<3
+pillow>=10,<13

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ground_truth.v1.schema.json",
+  "title": "Audit ground truth v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "source_name",
+    "scope",
+    "items",
+    "systems"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "audit_ground_truth"
+    },
+    "source_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "name", "category"],
+        "properties": {
+          "item_id": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9]*-[0-9]{2}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "systems": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "pattern": "^[A-Z][A-Z0-9]*-[0-9]{2}$"
+        },
+        "additionalProperties": {
+          "enum": ["passed", "failed", "not_applicable"]
+        }
+      }
+    }
+  }
+}
