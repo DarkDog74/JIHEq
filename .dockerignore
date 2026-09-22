@@ -1,0 +1,46 @@
+# 构建上下文排除清单
+# 项目目录总计约 4.0G，其中绝大部分是跑批产物和评测数据，不应进入镜像。
+
+# --- 版本控制与虚拟环境 ---
+.git
+.gitignore
+.venv/
+.venv_旧环境_*/
+venv/
+env/
+
+# --- 密钥：绝不进入镜像层，即使后续删除仍可从历史层还原 ---
+secrets.env
+secrets.env_副本*
+secrets.env_副本2
+*.env
+!secrets.env.example
+
+# --- 大数据：跑批产物与评测原始材料 ---
+output/
+评估集201/
+docs/qq/
+release/
+reference_data/ground_truth.v1.json
+模型稽核指标对比.xlsx
+*.log
+
+# --- 前端依赖：保留 frontend/dist，网页由它提供 ---
+frontend/node_modules/
+frontend/test-results/
+frontend/playwright-report/
+frontend/*.tsbuildinfo
+
+# --- Python 缓存 ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 系统文件 ---
+.DS_Store
+Thumbs.db
+.~*
+~$*

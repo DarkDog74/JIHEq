@@ -1,0 +1,24 @@
+services:
+  audit:
+    build: .
+    image: jihe-audit:latest
+    container_name: jihe-audit
+    ports:
+      - "8765:8765"
+    environment:
+      AUDIT_HOST: 0.0.0.0
+      AUDIT_PORT: "8765"
+      AUDIT_PLATFORM_OUTPUT: /app/output/单系统
+      # 若 MinerU 跑在宿主机上，把 config/paths.json 的 mineru_url
+      # 改成 http://host.docker.internal:18001/file_parse
+      MINERU_URL: http://host.docker.internal:18001/file_parse
+    volumes:
+      # 跑批产物与平台状态（含 model_config.json，内有 API Key）
+      - ./output:/app/output
+      # 待稽核的原始文档目录。容器内没有原生文件夹选择弹窗，
+      # 界面上请直接手填容器内路径，例如 /data/待稽核系统
+      - ./评估集201:/data:ro
+    extra_hosts:
+      # 让容器内可通过 host.docker.internal 访问宿主机的 MinerU
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
