@@ -160,6 +160,15 @@ export interface AuditSummary {
   }
 }
 
+export interface AuthPreset {
+  key: string
+  label: string
+  auth_header: string
+  auth_scheme: string
+  chat_path: string
+  stream: boolean
+}
+
 export interface ModelConfig {
   base_url: string
   api_key_set: boolean
@@ -167,6 +176,19 @@ export interface ModelConfig {
   model: string
   suggested_models: string[]
   timeout_seconds: number
+  auth_header: string
+  auth_scheme: string
+  chat_path: string
+  stream: boolean
+  max_tokens: number
+  /** 原样合并进请求体的 JSON 对象文本；非空时平台不再自动加思考参数 */
+  extra_body: string
+  /** 原样合并进请求头的 JSON 对象文本 */
+  extra_headers: string
+  extra_body_active: boolean
+  auth_presets: AuthPreset[]
+  /** 后端按当前配置拼出的完整请求地址，直接展示，省得靠猜 */
+  endpoint_preview: string
   configured: boolean
 }
 
@@ -175,11 +197,19 @@ export interface ModelConfigForm {
   api_key: string
   model: string
   timeout_seconds: number
+  auth_header: string
+  auth_scheme: string
+  chat_path: string
+  stream: boolean
+  max_tokens: number
+  extra_body: string
+  extra_headers: string
 }
 
 export interface ModelTestResult {
   ok: boolean
   latency_ms: number | null
   model: string
+  endpoint?: string
   message: string
 }

@@ -25,3 +25,26 @@
 .header-link-btn:hover{border-color:color-mix(in srgb,var(--blue) 45%,var(--line));color:var(--text)}
 .settings-view{padding:50px 0}.settings-heading{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:28px}.settings-heading h1{margin:0 0 8px;font-size:clamp(30px,4vw,52px);letter-spacing:-.04em}.settings-heading p{margin:0;color:var(--muted);font-size:11px}.settings-layout{display:grid;grid-template-columns:minmax(420px,1.15fr) minmax(300px,.85fr);gap:16px;align-items:start}.config-panel,.model-status-panel{border-radius:24px;padding:28px}.config-field{display:block;margin-top:18px}.config-field>span{display:block;margin:0 0 9px 4px;color:var(--muted);font-size:10px}.config-field input{width:100%;height:46px;border:1px solid var(--line);border-radius:12px;outline:0;background:color-mix(in srgb,var(--panel) 86%,transparent);color:var(--text);padding:0 13px;font-size:12px}.config-field input:focus{border-color:color-mix(in srgb,var(--blue) 58%,var(--line));box-shadow:0 0 0 4px color-mix(in srgb,var(--blue) 8%,transparent)}.config-field input[readonly]{color:var(--blue);cursor:default}.config-field>small{display:block;margin:7px 0 0 4px;color:var(--muted);font-size:9px}.key-row{display:grid;grid-template-columns:1fr auto;gap:8px}.key-row button{border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--panel) 82%,var(--blue) 8%);color:var(--blue);padding:0 15px;font-size:10px}.config-actions{display:flex;gap:10px;margin-top:26px}.config-actions .primary-action{width:auto;flex:1;height:46px;margin:0;justify-content:center}.config-actions button:disabled{opacity:.55;cursor:default}.saved-banner{margin:16px 0 0;border:1px solid color-mix(in srgb,var(--green) 24%,transparent);border-radius:11px;background:color-mix(in srgb,var(--green) 7%,transparent);color:var(--green);padding:11px 13px;font-size:11px}.model-status-main{display:flex;align-items:center;gap:10px;margin-top:26px;color:var(--muted)}.model-status-main i{width:10px;height:10px;border-radius:50%;background:var(--muted);box-shadow:0 0 14px currentColor}.model-status-main.ok{color:var(--green)}.model-status-main.failed{color:var(--red)}.model-status-panel>p{min-height:48px;color:var(--muted);font-size:10px;line-height:1.7}.model-status-panel dl{margin:24px 0 0;border-top:1px solid var(--line)}.model-status-panel dl div{display:flex;justify-content:space-between;padding:13px 0;border-bottom:1px solid var(--line);font-size:10px}.model-status-panel dt{color:var(--muted)}.model-status-panel dd{margin:0;color:var(--text);font-family:"SFMono-Regular",Consolas,monospace}.settings-view .error-banner{margin-top:16px}
 @media(max-width:900px){.settings-layout{grid-template-columns:1fr}}@media(max-width:760px){.settings-heading{display:block}.settings-heading button{margin-top:18px}.header-link-btn{margin-right:8px;padding:7px 10px}}
+
+/* 从本机上传文件夹 —— 用 <input webkitdirectory> 调起用户自己电脑上的文件夹
+   选择框，再把文件逐个传到服务器。平台原有的原生弹窗跑在服务器那台机器上
+   （macOS 走 osascript、Linux 走 tkinter），容器里既没有 libtk 也没有
+   $DISPLAY，必然失败，所以改成上传。见 platform_app/folder_picker.py */
+.folder-input{display:none}
+.upload-progress{margin:16px 0 0;border:1px solid color-mix(in srgb,var(--cyan) 24%,transparent);border-radius:11px;background:color-mix(in srgb,var(--cyan) 7%,transparent);color:var(--cyan);padding:11px 13px;font-size:11px}
+
+/* 模型配置页的「请求形态」分组 —— 默认适配 OpenAI 兼容服务，
+   改成自定义时左侧加一条色条提示已偏离默认 */
+.config-group{margin-top:26px;border-top:1px solid var(--line);padding-top:20px}
+.config-group.custom{border-top-color:color-mix(in srgb,var(--amber) 45%,var(--line))}
+.config-group-title{color:var(--muted);font-size:10px;margin-bottom:4px}
+.config-group-title small{display:block;margin-top:5px;color:color-mix(in srgb,var(--muted) 80%,transparent);font-size:9px;line-height:1.6}
+.config-field select{width:100%;height:46px;border:1px solid var(--line);border-radius:12px;outline:0;background:color-mix(in srgb,var(--panel) 86%,transparent);color:var(--text);padding:0 13px;font-size:12px}
+.config-field select:focus{border-color:color-mix(in srgb,var(--blue) 58%,var(--line));box-shadow:0 0 0 4px color-mix(in srgb,var(--blue) 8%,transparent)}
+.config-field textarea{width:100%;border:1px solid var(--line);border-radius:12px;outline:0;background:color-mix(in srgb,var(--panel) 86%,transparent);color:var(--text);padding:11px 13px;font-family:"SFMono-Regular",Consolas,monospace;font-size:11px;line-height:1.7;resize:vertical}
+.config-field textarea:focus{border-color:color-mix(in srgb,var(--blue) 58%,var(--line));box-shadow:0 0 0 4px color-mix(in srgb,var(--blue) 8%,transparent)}
+.config-checkbox{display:flex;align-items:center;gap:9px;margin-top:18px;color:var(--text);font-size:11px}
+.config-checkbox input{width:16px;height:16px;accent-color:var(--blue);margin:0}
+.config-checkbox small{color:var(--muted);font-size:9px}
+.config-endpoint{margin:16px 0 0;color:var(--muted);font-size:10px;line-height:1.7}
+.config-endpoint code{display:inline-block;max-width:100%;overflow-wrap:anywhere;color:var(--blue);font-family:"SFMono-Regular",Consolas,monospace;font-size:10px}

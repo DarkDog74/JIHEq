@@ -9,6 +9,7 @@ import type {
   AuditItem,
   AuditProgressEvent,
   AuditSummary,
+  AuthPreset,
   Job,
   ModelConfig,
   ModelConfigForm,
@@ -55,7 +56,14 @@ const sourcePath = ref('')
 const preview = ref<SourcePreview | null>(null)
 const recentSystems = ref<Record<string, string>[]>([])
 const validating = ref(false)
-const selectingFolder = ref(false)
+// 从用户自己的电脑上传文件夹。
+// 浏览器把选中目录下的每个文件连同 webkitRelativePath 逐个传上来，
+// 服务器按原目录结构还原，再交给原有的校验/稽核流程。
+const folderInput = ref<HTMLInputElement | null>(null)
+const uploading = ref(false)
+const uploadDone = ref(0)
+const uploadTotal = ref(0)
+const UPLOAD_CONCURRENCY = 3
 const starting = ref(false)
 const error = ref('')
 const job = ref<Job | null>(null)
@@ -72,7 +80,60 @@ const modelForm = ref<ModelConfigForm>({
   api_key: '',
   model: 'glm-5v-turbo',
   timeout_seconds: 120,
+  // 请求形态：默认值等于平台一直以来的行为，改这些是为了适配非标准网关
+  auth_header: 'Authorization',
+  auth_scheme: 'Bearer',
+  chat_path: '/chat/completions',
+  stream: false,
+  max_tokens: 1024,
+  extra_body: '',
+  extra_headers: '',
 })
+// 各厂商思考参数的写法差别很大，给几个现成的直接填，
+// 用户不用去翻文档，也不用为换模型改代码
+const extraBodyExamples = [
+  { key: 'qwen', label: 'Qwen / 阿里云百炼', value: '{\n  "enable_thinking": true,\n  "thinking_budget": 4000\n}' },
+  { key: 'glm', label: '智谱 GLM-5.3（不支持关闭思考）', value: '{\n  "thinking": {"type": "enabled"},\n  "reasoning_effort": "low"\n}' },
+  { key: 'deepseek', label: 'DeepSeek', value: '{\n  "thinking": {"type": "enabled"},\n  "reasoning_effort": "high"\n}' },
+  { key: 'off', label: '清空（不附加任何参数）', value: '' },
+]
+const modelPresets = ref<AuthPreset[]>([])
+const modelPresetKey = ref('')
+// 后端按配置拼出的地址也返回了，但这里按输入实时算，改一个字就能看到结果
+const endpointPreview = computed(() => {
+  const base = (modelForm.value.base_url || '').trim().replace(/\/+$/, '')
+  const path = (modelForm.value.chat_path || '').trim()
+  if (!base) return ''
+  if (!path) return base
+  return base + (path.startsWith('/') ? path : '/' + path)
+})
+const isDefaultRequestShape = computed(() =>
+  modelForm.value.auth_header === 'Authorization'
+  && modelForm.value.auth_scheme === 'Bearer'
+  && modelForm.value.chat_path === '/chat/completions'
+  && !modelForm.value.stream
+)
+
+function applyPreset(key: string) {
+  modelPresetKey.value = key
+  const preset = modelPresets.value.find(item => item.key === key)
+  if (!preset) return
+  modelForm.value.auth_header = preset.auth_header
+  modelForm.value.auth_scheme = preset.auth_scheme
+  modelForm.value.chat_path = preset.chat_path
+  modelForm.value.stream = preset.stream
+}
+
+function onPresetChange(event: Event) {
+  applyPreset((event.target as HTMLSelectElement).value)
+}
+
+function onExtraExampleChange(event: Event) {
+  const select = event.target as HTMLSelectElement
+  const example = extraBodyExamples.find(item => item.key === select.value)
+  if (example) modelForm.value.extra_body = example.value
+  select.value = ''
+}
 const modelSuggestions = ref(['glm-5v-turbo', 'glm-5.3-flash'])
 const modelApiKeySet = ref(false)
 const modelApiKeyMasked = ref('')
@@ -167,8 +228,18 @@ const passRate = computed(() => {
 })
 const currentAiItem = computed(() => liveAiItems.value[activeAiItemId.value] || null)
 
+// 部署在反向代理的子路径下时所有请求都要带前缀，前缀来自 vite.config.ts 的
+// base（打包时写死进产物）。去掉尾部斜杠方便拼接。
+const API_BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init })
+  // 上传文件时 body 是 File/Blob，必须让浏览器自己决定 Content-Type，
+  // 硬设成 application/json 会把二进制内容发坏。
+  const isBinary = init?.body instanceof FormData || init?.body instanceof Blob
+  const headers = isBinary
+    ? init?.headers
+    : { 'Content-Type': 'application/json', ...(init?.headers as Record<string, string> | undefined) }
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: `请求失败：${response.status}` }))
     throw new Error(payload.detail || '请求失败')
@@ -196,7 +267,16 @@ async function enterSettings() {
       api_key: '',
       model: config.model,
       timeout_seconds: config.timeout_seconds,
+      auth_header: config.auth_header ?? 'Authorization',
+      auth_scheme: config.auth_scheme ?? 'Bearer',
+      chat_path: config.chat_path ?? '/chat/completions',
+      stream: config.stream ?? false,
+      max_tokens: config.max_tokens ?? 1024,
+      extra_body: config.extra_body ?? '',
+      extra_headers: config.extra_headers ?? '',
     }
+    modelPresets.value = config.auth_presets?.length ? config.auth_presets : []
+    modelPresetKey.value = ''
     modelSuggestions.value = config.suggested_models?.length
       ? config.suggested_models
       : modelSuggestions.value
@@ -656,17 +736,52 @@ async function validateSource() {
   finally { validating.value = false }
 }
 
-async function selectFolder() {
+function pickLocalFolder() {
   error.value = ''
-  selectingFolder.value = true
+  folderInput.value?.click()
+}
+
+async function onFolderPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const picked = Array.from(input.files || [])
+  // 清空 value，否则再次选同一个文件夹不会触发 change
+  input.value = ''
+  if (!picked.length) return
+
+  type PickedFile = File & { webkitRelativePath?: string }
+  const files = picked as PickedFile[]
+  // webkitRelativePath 形如 "某系统/材料/文件.pdf"，第一段就是用户选中的文件夹名
+  const rootName = (files[0].webkitRelativePath || files[0].name).split('/')[0]
+
+  uploading.value = true
+  uploadDone.value = 0
+  uploadTotal.value = files.length
+  error.value = ''
   try {
-    const selected = await api<{ cancelled: boolean; source_path: string | null }>('/api/systems/select-folder', { method: 'POST' })
-    if (!selected.cancelled && selected.source_path) {
-      sourcePath.value = selected.source_path
-      await validateSource()
+    // 并发上传，队列取空即止；顺序无所谓，服务端按相对路径各自落盘。
+    // 文件走原始请求体（不走 multipart），目录名和相对路径放查询参数。
+    const queue = [...files]
+    const worker = async () => {
+      while (queue.length) {
+        const file = queue.shift()!
+        const query = new URLSearchParams({
+          folder: rootName,
+          relative_path: file.webkitRelativePath || file.name,
+        })
+        await api<{ ok: boolean }>(`/api/systems/upload?${query}`, { method: 'POST', body: file })
+        uploadDone.value += 1
+      }
     }
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : String(caught) }
-  finally { selectingFolder.value = false }
+    await Promise.all(Array.from({ length: UPLOAD_CONCURRENCY }, worker))
+
+    const done = await api<{ source_path: string }>('/api/systems/upload/finish', {
+      method: 'POST', body: JSON.stringify({ folder: rootName }),
+    })
+    sourcePath.value = done.source_path
+    await validateSource()
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : String(caught)
+  } finally { uploading.value = false }
 }
 
 async function startJob() {
@@ -691,7 +806,7 @@ function connectEvents(jobId: string) {
     resetResultGate()
     connectedEventJobId = jobId
   }
-  events = new EventSource(`/api/jobs/${jobId}/events`)
+  events = new EventSource(`${API_BASE}/api/jobs/${jobId}/events`)
   events.onmessage = event => receiveEvent(event)
   for (const eventType of aiEventTypes) {
     events.addEventListener(eventType, event => receiveEvent(event as MessageEvent, eventType))
@@ -784,7 +899,7 @@ function resetHome() {
   void loadRecent()
 }
 
-function reportUrl() { return summary.value ? `/api/systems/${summary.value.system.id}/report` : '#' }
+function reportUrl() { return summary.value ? `${API_BASE}/api/systems/${summary.value.system.id}/report` : '#' }
 function extractedPreview(item: AuditItem) {
   if (!item.extracted_summary?.length) return '未生成提取字段'
   return item.extracted_summary.map(entry => `${entry.field}：${entry.value}`).join(' ｜ ')
@@ -870,7 +985,8 @@ onBeforeUnmount(() => {
       <section v-if="view === 'home'" class="home-view">
         <div class="launch-console glass-panel">
           <div class="panel-top"><div><h2>启动全量稽核</h2></div><span class="system-ready">系统就绪</span></div>
-          <label class="path-field" :class="{ focused: sourcePath }"><span>业务系统文件夹</span><div><i>/</i><input v-model="sourcePath" @keyup.enter="validateSource" placeholder="选择文件夹，或粘贴完整路径" autocomplete="off"><button class="folder-button" @click.prevent="selectFolder" :disabled="selectingFolder || validating">{{ selectingFolder ? '选择中…' : '选择文件夹' }}</button><button @click.prevent="validateSource" :disabled="validating || selectingFolder">{{ validating ? '识别中' : '识别材料' }}</button></div></label>
+          <label class="path-field" :class="{ focused: sourcePath }"><span>业务系统文件夹</span><div><i>/</i><input v-model="sourcePath" @keyup.enter="validateSource" placeholder="选择文件夹，或粘贴完整路径" autocomplete="off"><input ref="folderInput" type="file" webkitdirectory multiple class="folder-input" @change="onFolderPicked"><button class="folder-button" @click.prevent="pickLocalFolder" :disabled="uploading || validating">{{ uploading ? `上传中 ${uploadDone}/${uploadTotal}` : '选择文件夹' }}</button><button @click.prevent="validateSource" :disabled="validating || uploading">{{ validating ? '识别中' : '识别材料' }}</button></div></label>
+          <p v-if="uploading" class="upload-progress">正在上传本机文件夹：{{ uploadDone }} / {{ uploadTotal }} 个文件…</p>
           <p v-if="error" class="error-banner">{{ error }}</p>
           <div v-if="!preview && recentSystems.length" class="recent-block"><div class="section-label">最近处理</div><button v-for="system in recentSystems.slice(0, 4)" :key="system.id" class="recent-row" @click="sourcePath = system.source_path; validateSource()"><span><b>{{ system.display_name }}</b><small>{{ system.department }}</small></span><i>→</i></button></div>
           <div v-if="preview" class="preview-block">
@@ -937,6 +1053,20 @@ onBeforeUnmount(() => {
             <label class="config-field"><span>API Key</span><div class="key-row"><input :type="showKey ? 'text' : 'password'" v-model.trim="modelForm.api_key" :placeholder="modelApiKeySet ? `已保存 ${modelApiKeyMasked}，留空保持不变` : '填写已轮换的新密钥'" autocomplete="new-password"><button type="button" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button></div></label>
             <label class="config-field"><span>统一模型</span><input v-model.trim="modelForm.model" list="model-code-options" aria-label="统一模型" autocomplete="off" spellcheck="false"><datalist id="model-code-options"><option v-for="model in modelSuggestions" :key="model" :value="model"></option></datalist><small>可选择 glm-5v-turbo、glm-5.3-flash，或输入服务端支持的其他模型编码；图片稽核必须选择支持视觉输入的模型</small></label>
             <label class="config-field"><span>请求超时（秒）</span><input type="number" v-model.number="modelForm.timeout_seconds" min="3" max="300" step="1"></label>
+            <div class="config-group" :class="{ custom: !isDefaultRequestShape }">
+              <div class="config-group-title">请求形态<small>默认适配 OpenAI 兼容服务；自建网关按需修改，改错了「测试连接」会报出实际请求的地址</small></div>
+              <label class="config-field"><span>认证方式</span><select :value="modelPresetKey" @change="onPresetChange"><option value="">自定义</option><option v-for="preset in modelPresets" :key="preset.key" :value="preset.key">{{ preset.label }}</option></select></label>
+              <label class="config-field"><span>认证头名称</span><input v-model.trim="modelForm.auth_header" autocomplete="off" spellcheck="false"><small>OpenAI 兼容服务填 Authorization；自定义网关可能是 Authorization-Gateway</small></label>
+              <label class="config-field"><span>认证值前缀</span><input v-model.trim="modelForm.auth_scheme" placeholder="留空表示这个头里只放密钥本身" autocomplete="off" spellcheck="false"><small>标准为 Bearer，即 Authorization: Bearer &lt;key&gt;；留空则只发 &lt;key&gt;</small></label>
+              <label class="config-field"><span>对话路径</span><input v-model.trim="modelForm.chat_path" placeholder="留空表示接入地址本身就是完整端点" autocomplete="off" spellcheck="false"><small>OpenAI 兼容服务填 /chat/completions；自建网关通常留空</small></label>
+              <label class="config-checkbox"><input type="checkbox" v-model="modelForm.stream"><span>使用流式响应（SSE）</span><small>部分网关只接受 stream=true</small></label>
+              <label class="config-field"><span>最大输出 token</span><input type="number" v-model.number="modelForm.max_tokens" min="128" max="32768" step="128"><small>思考内容也算在这个额度里。推理模型建议 4096 以上，1024 很容易被思考吃光</small></label>
+              <label class="config-field"><span>附加请求参数（JSON）</span><textarea v-model="modelForm.extra_body" rows="4" spellcheck="false" autocomplete="off" placeholder='{"enable_thinking": true}'></textarea><small>厂商特有的参数写这里，原样合并进请求体。<b>填了就完全以它为准</b>，平台不再自动添加思考类参数。思考的开关和强度也在这里控制——各家的参数名并不统一（Qwen 用 enable_thinking + thinking_budget，智谱和 DeepSeek 用 thinking.type + reasoning_effort），写在这里就不用为换模型改代码</small></label>
+              <label class="config-field"><span>快速填入</span><select :value="''" @change="onExtraExampleChange"><option value="">— 选一个厂商自动填入上面 —</option><option v-for="example in extraBodyExamples" :key="example.key" :value="example.key">{{ example.label }}</option></select></label>
+              <label class="config-field"><span>附加请求头（JSON）</span><textarea v-model="modelForm.extra_headers" rows="2" spellcheck="false" autocomplete="off" placeholder='{"X-Custom-Header": "value"}'></textarea><small>需要额外请求头的网关用；认证头一般用上面的「认证方式」配置即可</small></label>
+              <p v-if="modelForm.extra_body.trim()" class="config-endpoint">已启用附加参数，平台不会自动添加 thinking / reasoning_effort，请求体以你写的为准</p>
+              <p class="config-endpoint">实际请求：<code>{{ endpointPreview || '（未填写接入地址）' }}</code></p>
+            </div>
             <div class="config-actions"><button type="submit" class="primary-action" :disabled="savingModel"><span>{{ savingModel ? '正在保存…' : '保存配置' }}</span></button><button type="button" class="secondary-action" :disabled="testingModel" @click="runModelTest">{{ testingModel ? '测试中…' : '测试连接' }}</button></div>
             <p v-if="settingsError" class="error-banner">{{ settingsError }}</p><p v-else-if="settingsSaved" class="saved-banner">配置已保存，后续稽核将使用这套统一模型配置</p>
           </form>

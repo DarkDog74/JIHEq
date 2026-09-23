@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import sys
+import time
 import traceback
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -125,6 +126,47 @@ def _precomputed_ai_result(payload: Mapping[str, object]) -> dict[str, object] |
         result["error_message"] = str(raw.get("text") or "语义识别未完成")
     _persist_ai_attachment(payload, result)
     return result
+
+
+# AI 流式增量转发的最小间隔（秒）。前端有打字机效果，合并发不影响观感；
+# 不合并的话每个 token 都会往事件文件里写一行，一个稽核项能写上千行。
+_AI_DELTA_MIN_INTERVAL = 0.4
+
+
+def _make_ai_emitter(emit: Callable[[dict[str, object]], None]):
+    """把 AI 流式事件转发给前端，对 delta 做节流合并。
+
+    前端右侧「顺序稽核」面板完全靠这些事件驱动：一条都没收到时只显示
+    「正在准备稽核项…」。原先这里传的是空回调，事件全被丢掉，于是模型跑
+    多久、页面上就空白多久——三十秒起步，看着跟卡死没区别。
+    """
+    pending: list[str] = []
+    last_event: dict[str, object] | None = None
+    last_sent = 0.0
+
+    def flush() -> None:
+        nonlocal last_sent
+        if last_event is None or not pending:
+            return
+        merged = {**last_event, "delta": "".join(pending)}
+        pending.clear()
+        last_sent = time.monotonic()
+        emit(merged)
+
+    def forward(event: dict[str, object]) -> None:
+        nonlocal last_event
+        if str(event.get("type") or "") != "ai_delta":
+            # 开始 / 完成 / 失败事件原样转发：完成事件里带着完整正文，
+            # 前端靠它定稿，不能被节流吞掉。
+            flush()
+            emit(event)
+            return
+        last_event = event
+        pending.append(str(event.get("delta") or ""))
+        if time.monotonic() - last_sent >= _AI_DELTA_MIN_INTERVAL:
+            flush()
+
+    return forward
 
 
 def _run_ai_item(
@@ -340,11 +382,12 @@ def run_job(job_id: str, database_path: Path) -> int:
     preview = preview_source(source)
     parse_result = run_unit_parse(source, parsed_dir, on_event=emit)
     db.update_job(job_id, stage="auditing", progress=0.35, message="解析完成，开始运行全部稽核项")
-    try:
-        ai_service = create_ai_service()
-    except Exception:
-        # AI is an optional attachment. Initialization failure must not stop auditing.
-        ai_service = None
+    def _make_ai_service():
+        try:
+            return create_ai_service()
+        except Exception:
+            # AI is an optional attachment. Initialization failure must not stop auditing.
+            return None
 
     def narrate_before_publish(payload: dict[str, object]) -> dict[str, object]:
         item_id = str(payload.get("item_id") or "")
@@ -356,10 +399,16 @@ def run_job(job_id: str, database_path: Path) -> int:
             progress=0.35 + 0.60 * ((current - 1) / total),
             message=f"规则已完成，LLM 正在处理 {item_id}",
         )
+        # 每个稽核项都重新构造一次 AI 服务，也就是重新读一次模型配置。
+        # 原先在任务开始时读一次就缓存全程，导致调思考参数、token 上限时
+        # 必须取消任务重跑才生效——调参阶段这样太折磨人。
+        # 重新构造很便宜：HTTP 客户端本来就是每次调用新建的。
+        ai_service = _make_ai_service()
         _seed_ai_cache(ai_service, payload, final)
-        # Do not persist partial model events. The single audit_complete record
-        # below is the public queue entry and is written only after LLM returns.
-        return _run_ai_item(ai_service, payload, lambda _event: None)
+        # 把 AI 流式事件转发给前端：右侧面板靠它显示正在处理哪一项、
+        # 正文也随流式增长。delta 由 _make_ai_emitter 节流合并，
+        # 不会把事件文件写爆。最终仍以 ai_completed 里的完整正文定稿。
+        return _run_ai_item(ai_service, payload, _make_ai_emitter(emit))
 
     audit_summary = run_unit_audits(
         parsed_dir,

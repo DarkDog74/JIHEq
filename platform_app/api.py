@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .audit_service import normalize_audit_summary, paired_item_ids
-from .config import PROJECT_ROOT, ai_config_status
+from .config import BROWSE_ROOT, PROJECT_ROOT, UPLOAD_ROOT, ai_config_status
 from .database import Database
 from .events import event_path
 from .folder_picker import FolderPickerError, choose_system_folder
@@ -34,15 +35,68 @@ class ModelConfigRequest(BaseModel):
     api_key: str = ""
     model: str = DEFAULT_MODEL
     timeout_seconds: int = 120
+    # 请求形态：默认为 None 表示「本次没传」，交给 normalize_config 填默认值，
+    # 这样只传上面 4 个字段的旧客户端行为不变。
+    # 注意空字符串是有意义的值——auth_scheme="" 表示认证头里只放密钥本身，
+    # chat_path="" 表示接入地址本身就是完整端点，两者都不能当缺省处理。
+    auth_header: str | None = None
+    auth_scheme: str | None = None
+    chat_path: str | None = None
+    stream: bool | None = None
+    # 思考参数与最大输出 token。推理模型的思考也计入 max_tokens，
+    # 额度不够时正文会是空的。
+    max_tokens: int | None = None
+    # 各厂商差异的通用出口：原样合并进请求体/请求头的 JSON 对象文本。
+    # 非空时平台不再自动添加任何思考类参数，完全以这里写的为准。
+    extra_body: str | None = None
+    extra_headers: str | None = None
 
 
 db = Database()
 jobs = JobManager(db)
+
+# 部署在反向代理的子路径下时设置，例如 AUDIT_URL_PREFIX=/chuilei/jihe。
+# 留空表示直接挂在根路径（本地直连时的默认行为）。
+_URL_PREFIX = os.environ.get("AUDIT_URL_PREFIX", "").strip().rstrip("/")
+
+
+class _UrlPrefixMiddleware:
+    """把请求路径上的子路径前缀剥掉，再交给路由匹配。
+
+    用纯 ASGI 中间件而不是 BaseHTTPMiddleware：直接改写 scope["path"]，
+    路由看到的就是剥掉前缀的路径。
+
+    这样做的结果是后端**同时**接受 /chuilei/jihe/api/health 和 /api/health，
+    反向代理剥不剥前缀都能跑，不用为了代理配置去改路由定义。
+
+    注意：这里**不能**再设 scope["root_path"]。
+    Starlette 的 StaticFiles.get_path() 会用 get_route_path() 从 scope["path"]
+    里把 root_path 再剥一次；路径已经在上面剥过了，再设 root_path 就会剥不掉，
+    最终去找 .../assets/assets/index-xxx.js 这种多一层目录的路径，静态资源全 404。
+    代价是 /docs 里生成的 URL 不带前缀，只影响自带文档页，不影响业务。
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == _URL_PREFIX or path.startswith(_URL_PREFIX + "/"):
+                scope = dict(scope)
+                scope["path"] = path[len(_URL_PREFIX):] or "/"
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="浙江移动-定级备案报告稽核系统", version="1.0.0")
+if _URL_PREFIX:
+    app.add_middleware(_UrlPrefixMiddleware)
 
 
 def _job_or_404(job_id: str) -> dict[str, object]:
-    job = db.get_job(job_id)
+    # 走 jobs.get_job 而不是 db.get_job：它顺带确认工作进程还活着，
+    # 进程崩了就把任务标成 failed，避免前端对着永远不动的 queued 无限轮询。
+    job = jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return job
@@ -116,6 +170,182 @@ def select_system_folder() -> dict[str, object]:
     except FolderPickerError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
     return {"cancelled": selected is None, "source_path": str(selected) if selected else None}
+
+
+@app.get("/api/systems/browse")
+def browse_system_folders(path: str = "") -> dict[str, object]:
+    """列出 BROWSE_ROOT 之下的子目录，供网页端的文件夹选择器使用。
+
+    原生弹窗那条路在容器里走不通（见 folder_picker 里的说明），所以网页端
+    自己列目录。只允许在 BROWSE_ROOT 之内浏览：请求路径先 resolve 再判断是否
+    仍在根之下，这样 "../" 和指向外部的符号链接都绕不出去。
+    """
+    root = BROWSE_ROOT
+    if not root.is_dir():
+        return {
+            "ok": False,
+            "message": (
+                f"浏览根目录不存在：{root}。"
+                "请把待稽核目录挂载进容器，或用 AUDIT_BROWSE_ROOT 指定别的位置。"
+            ),
+            "root": str(root),
+            "path": "",
+            "parent": None,
+            "directories": [],
+        }
+
+    raw = (path or "").strip()
+    target = Path(raw).expanduser() if raw else root
+    if not target.is_absolute():
+        target = root / target
+    try:
+        target = target.resolve()
+    except OSError as error:
+        raise HTTPException(status_code=400, detail=f"路径无法解析：{error}") from error
+
+    if target != root and not target.is_relative_to(root):
+        raise HTTPException(status_code=403, detail="只允许浏览指定的数据目录")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"目录不存在：{target}")
+
+    try:
+        children = sorted(
+            (
+                child
+                for child in target.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            ),
+            key=lambda child: child.name,
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=f"没有权限读取该目录：{error}") from error
+
+    return {
+        "ok": True,
+        "root": str(root),
+        "path": str(target),
+        "parent": str(target.parent) if target != root else None,
+        "directories": [{"name": child.name, "path": str(child)} for child in children],
+    }
+
+
+_UPLOAD_FOLDER_MAX_CHARS = 80
+
+
+def _upload_folder_name(folder: str) -> str:
+    """校验浏览器传来的顶层文件夹名。文件夹名来自浏览器，不可信。"""
+    name = (folder or "").strip()
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="缺少文件夹名")
+    if len(name) > _UPLOAD_FOLDER_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="文件夹名过长")
+    if "/" in name or "\\" in name or "\x00" in name:
+        raise HTTPException(status_code=400, detail="文件夹名不能包含路径分隔符")
+    return name
+
+
+def _upload_target(folder: str) -> tuple[Path, str]:
+    """解析成 UPLOAD_ROOT 下的目标目录，返回 (目录, 目录名)。
+
+    解析后再确认仍在 UPLOAD_ROOT 之内，防止写到卷外面去。
+    """
+    name = _upload_folder_name(folder)
+    root = UPLOAD_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    target = (root / name).resolve()
+    if not target.is_relative_to(root):
+        raise HTTPException(status_code=400, detail="文件夹名越界")
+    target.mkdir(parents=True, exist_ok=True)
+    return target, name
+
+
+def _upload_relative_path(relative: str) -> PurePosixPath:
+    """清洗浏览器给的相对路径，只保留安全的目录层级。
+
+    webkitRelativePath 形如 "某系统/材料/文件.pdf"。逐段校验而不是直接拼接，
+    任何一段是 .. 或 . 都拒绝，从根上杜绝目录穿越。
+    """
+    raw = (relative or "").replace("\\", "/").strip()
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts:
+        raise HTTPException(status_code=400, detail="缺少文件相对路径")
+    if any(part == ".." for part in parts):
+        raise HTTPException(status_code=400, detail="相对路径不能包含 ..")
+    if any("\x00" in part for part in parts):
+        raise HTTPException(status_code=400, detail="相对路径含非法字符")
+    return PurePosixPath(*parts)
+
+
+def _strip_root_segment(relative: PurePosixPath, folder_name: str) -> PurePosixPath:
+    """去掉相对路径开头与目标文件夹重名的那一段。
+
+    浏览器的 webkitRelativePath 会把用户选中的顶层文件夹名也带上
+    （"某系统/材料/a.pdf"），而目标目录已经用了这个文件夹名，直接拼接会变成
+    某系统/某系统/材料/a.pdf，多套一层。这里把首段对齐掉。
+    """
+    if relative.parts and relative.parts[0] == folder_name:
+        trimmed = PurePosixPath(*relative.parts[1:])
+        if not trimmed.parts:
+            raise HTTPException(status_code=400, detail="相对路径没有文件名")
+        return trimmed
+    return relative
+
+
+@app.post("/api/systems/upload")
+async def upload_system_file(
+    request: Request,
+    folder: str = Query(...),
+    relative_path: str = Query(...),
+) -> dict[str, object]:
+    """接收网页端上传的单个文件，按原目录结构落到 UPLOAD_ROOT 之下。
+
+    用户在**自己的电脑上**用浏览器的文件夹选择框选目录，浏览器逐个把文件连同
+    webkitRelativePath 传上来，这里还原成服务器上的目录树，之后交给原有的
+    校验/稽核流程，与服务器本地目录走的是同一条路径。
+
+    文件走**原始请求体**（application/octet-stream）而不是 multipart：
+    multipart 需要 python-multipart 依赖，而镜像里没有、目标服务器又装不了；
+    原始体还能边收边写盘，大文件不用整个读进内存。
+    目录名和相对路径放在查询参数里。
+    """
+    target, folder_name = _upload_target(folder)
+    relative = _strip_root_segment(_upload_relative_path(relative_path), folder_name)
+    destination = target / relative
+
+    # 相对路径已逐段校验过，这里再确认最终落点仍在目标目录内，作为兜底
+    if not destination.resolve().is_relative_to(target):
+        raise HTTPException(status_code=400, detail="目标路径越界")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with destination.open("wb") as handle:
+            async for chunk in request.stream():
+                written += len(chunk)
+                handle.write(chunk)
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"写入失败：{error}") from error
+
+    return {"ok": True, "relative_path": str(relative), "size": written}
+
+
+class UploadFinishRequest(BaseModel):
+    folder: str
+
+
+@app.post("/api/systems/upload/finish")
+def finish_upload(request: UploadFinishRequest) -> dict[str, object]:
+    """上传结束：返回可直接交给稽核流程的服务器路径。"""
+    target, _ = _upload_target(request.folder)
+    files = [path for path in target.rglob("*") if path.is_file()]
+    if not files:
+        raise HTTPException(status_code=400, detail="没有收到任何文件")
+    return {
+        "ok": True,
+        "source_path": str(target),
+        "file_count": len(files),
+        "total_bytes": sum(path.stat().st_size for path in files),
+    }
 
 
 @app.get("/api/systems")

@@ -14,6 +14,8 @@ from typing import Any
 import httpx
 
 from .config import AISettings, DEFAULT_LLM_PROMPT_VERSION, load_ai_settings
+from .model_config import build_thinking_params, merge_extra, parse_extra_body
+from .llm_transport import log_llm_request, log_llm_response, start_timer
 
 
 PROMPT_VERSION = DEFAULT_LLM_PROMPT_VERSION
@@ -373,13 +375,16 @@ def _request_for_data(data: Mapping[str, object], settings: AISettings) -> dict[
             {"role": "user", "content": content},
         ],
     }
-    if settings.model.strip().casefold() == _GLM_53_FLASH:
-        # GLM-5.3-Flash 仅支持 enabled；用 low 降低简短复述的思考延迟。
-        request["thinking"] = {"type": "enabled", "clear_thinking": False}
-        request["reasoning_effort"] = "low"
-    else:
-        # 其他支持关闭思考的模型继续走快速复述路径。
-        request["thinking"] = {"type": "disabled"}
+    # 思考参数由公共构造器统一生成，三条调用路径共用同一套规则。
+    # 用户填了「附加请求参数」就完全以他写的为准，平台不再自动补——
+    # 否则平台塞进去的 thinking:disabled 会把用户的 enable_thinking 盖掉。
+    extra_body_text = settings.extra_body
+    if not parse_extra_body({"extra_body": extra_body_text}):
+        request.update(
+            build_thinking_params(settings.model, default_disabled=True)
+        )
+    # 附加参数最后合并，所以能覆盖上面生成的任何字段
+    request, _ = merge_extra(request, {}, extra_body=extra_body_text)
     return request
 
 
@@ -518,6 +523,27 @@ def _status_error(status_code: int) -> AIServiceError:
     if status_code >= 500:
         return AIServiceError("service_unavailable", "AI服务暂时不可用")
     return AIServiceError("request_rejected", "AI服务拒绝了当前请求")
+
+
+def _empty_response_hint(finish_reason: str | None, reasoning_chars: int) -> str:
+    """正文为空时，把可能的原因和下一步动作一起给出来。
+
+    「AI服务未返回说明文字」这句话本身没法排查——推理模型把额度花在思考上、
+    网关不认 thinking 参数、服务端中途断开，看到的现象都是这一句。
+    """
+    parts = ["AI服务未返回说明文字"]
+    if reasoning_chars:
+        parts.append(f"（只收到 {reasoning_chars} 字思考内容，没有正文）")
+    if finish_reason == "length":
+        parts.append(
+            "：输出被 max_tokens 截断，思考把额度吃光了。"
+            "请调高「最大输出 token」，或在「思考参数」里改成 omit"
+        )
+    elif finish_reason:
+        parts.append(f"：finish_reason={finish_reason}")
+    else:
+        parts.append("：未收到结束标记，可能是服务端中断或该模型输出格式不同")
+    return "".join(parts)
 
 
 def _iter_sse_events(lines: Iterable[str]) -> Iterable[tuple[str, str]]:
@@ -735,11 +761,22 @@ class AuditAIService:
         body = serialize_request(request_payload)
         if len(body) > min(self.settings.max_input_bytes, MAX_REQUEST_BYTES):
             raise AIServiceError("input_too_large", "AI输入超过32 KiB限制")
+        # 认证头名称与值前缀都来自配置：OpenAI 兼容服务是
+        # "Authorization: Bearer <key>"，自建网关可能是
+        # "Authorization-Gateway: <key>"（无 Bearer 前缀）。
+        auth_scheme = self.settings.auth_scheme
         headers = {
-            "authorization": f"Bearer {self.settings.api_key}",
+            (self.settings.auth_header or "Authorization"): (
+                f"{auth_scheme} {self.settings.api_key}"
+                if auth_scheme
+                else self.settings.api_key
+            ),
             "content-type": "application/json",
             "accept": "text/event-stream",
         }
+        # 附加请求头：给需要自定义头的网关用
+        _, headers = merge_extra({}, headers, extra_headers=self.settings.extra_headers)
+        log_llm_request(self.settings.endpoint, headers, request_payload)
         if self._client is not None:
             return self._consume_stream(self._client, body, headers, on_delta)
         timeout = httpx.Timeout(
@@ -759,6 +796,10 @@ class AuditAIService:
         chunks: list[str] = []
         usage: dict[str, int] = {}
         finish_reason: str | None = None
+        # 推理模型的思考走 reasoning_content，和正文分开。这里只统计不采用，
+        # 用来在正文为空时区分「模型没答」和「模型只在思考」。
+        reasoning_chars = 0
+        timer = start_timer()
         with client.stream(
             "POST",
             self.settings.endpoint,
@@ -801,11 +842,20 @@ class AuditAIService:
                 if text:
                     chunks.append(text)
                     self._notify(on_delta, text)
+                elif isinstance(delta, Mapping):
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if isinstance(reasoning, str):
+                        reasoning_chars += len(reasoning)
         text = "".join(chunks).strip()
+        log_llm_response(
+            response.status_code,
+            timer.elapsed_ms,
+            f"正文{len(text)}字 思考{reasoning_chars}字 finish={finish_reason}",
+        )
         if not text:
             raise AIServiceError(
                 "empty_response",
-                "AI服务未返回说明文字",
+                _empty_response_hint(finish_reason, reasoning_chars),
                 finish_reason=finish_reason,
             )
         return text, usage, finish_reason

@@ -13,11 +13,25 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import httpx
 
-from platform_app.model_config import load_model_config
+from platform_app.llm_transport import (
+    LLMStreamError,
+    consume_stream,
+    log_llm_request,
+    log_llm_response,
+    start_timer,
+)
+from platform_app.model_config import (
+    build_auth_headers,
+    build_endpoint,
+    build_thinking_params,
+    load_model_config,
+    merge_extra,
+    parse_extra_body,
+)
 
 
 class ModelNotConfiguredError(RuntimeError):
@@ -44,14 +58,20 @@ _MAX_ERROR_DETAIL_CHARS = 240
 _GLM_53_FLASH = "glm-5.3-flash"
 
 
-def _model_thinking_controls(model: str) -> dict[str, Any]:
-    """GLM-5.3-Flash 强制思考；稽核场景使用最低推理档控制延迟。"""
-    if str(model).strip().casefold() != _GLM_53_FLASH:
-        return {}
-    return {
-        "thinking": {"type": "enabled", "clear_thinking": False},
-        "reasoning_effort": "low",
-    }
+def _thinking_controls(model: str) -> dict[str, Any]:
+    """规则调用路径的默认思考参数。default 档在本地不发（这是它原本的行为）。"""
+    return build_thinking_params(model, default_disabled=False)
+
+
+def _merge_extra(
+    payload: dict[str, Any], headers: dict[str, str], config: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    return merge_extra(
+        payload,
+        headers,
+        extra_body=config.get("extra_body"),
+        extra_headers=config.get("extra_headers"),
+    )
 
 
 def _content_text(content: Any) -> str:
@@ -83,50 +103,27 @@ class _NonRetryableHTTPError(ModelCallError):
     """内部信号：确定性 4xx（401/403/400 等，不含 429/408），重试无意义。"""
 
 
-def _post_once(payload: dict[str, Any], timeout: int) -> ModelReply:
-    config = load_model_config()
-    base_url = str(config.get("base_url") or "").rstrip("/")
-    api_key = str(config.get("api_key") or "")
-    model = str(payload.get("model") or "")
-    if not base_url or not model or not api_key:
-        raise ModelNotConfiguredError(
-            "模型未配置：请先在稽核平台「模型配置」页填写接入地址和 API Key"
-        )
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    started = time.perf_counter()
-    try:
-        response = httpx.post(
-            f"{base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-        )
-    except httpx.TimeoutException as error:
-        raise ModelCallError(f"模型请求超时（上限 {timeout} 秒）：{error}") from error
-    except httpx.HTTPError as error:
-        raise ModelCallError(f"模型请求失败：{error}") from error
-    elapsed_ms = round((time.perf_counter() - started) * 1000)
-
-    if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
+def _check_status(status_code: int, body_text: str, retry_after: str | None) -> None:
+    """把非 2xx 响应转成对应的内部异常。流式与非流式共用。"""
+    if status_code == 429:
         try:
             wait = float(retry_after) if retry_after else None
         except ValueError:
             wait = None
         raise _RateLimitedError(wait)
-    if response.status_code >= 400:
-        detail = response.text.strip()[:_MAX_ERROR_DETAIL_CHARS]
-        if 400 <= response.status_code < 500 and response.status_code != 408:
+    if status_code >= 400:
+        detail = str(body_text or "").strip()[:_MAX_ERROR_DETAIL_CHARS]
+        if 400 <= status_code < 500 and status_code != 408:
             # 401/403/400 等确定性 4xx：凭据或请求格式错误，重试只会白拖时间。
             raise _NonRetryableHTTPError(
-                f"模型服务返回 HTTP {response.status_code}：{detail}"
+                f"模型服务返回 HTTP {status_code}：{detail}"
             )
-        raise ModelCallError(f"模型服务返回 HTTP {response.status_code}：{detail}")
+        raise ModelCallError(f"模型服务返回 HTTP {status_code}：{detail}")
 
+
+def _read_blocking(response: httpx.Response) -> str:
+    """非流式响应：整体 JSON 里取 choices[0].message.content。"""
+    _check_status(response.status_code, response.text, response.headers.get("Retry-After"))
     try:
         message = response.json()["choices"][0]["message"]
         reply = _content_text(message.get("content"))
@@ -134,6 +131,71 @@ def _post_once(payload: dict[str, Any], timeout: int) -> ModelReply:
         raise ModelCallError("模型回复结构异常：缺少 choices[0].message.content") from error
     if not reply:
         raise _EmptyReplyError()
+    return reply
+
+
+def _read_streaming(response: httpx.Response) -> str:
+    """流式响应：把 SSE 增量拼成完整正文。"""
+    if response.status_code >= 400:
+        response.read()
+        _check_status(response.status_code, response.text, response.headers.get("Retry-After"))
+    try:
+        reply, _finish_reason = consume_stream(response.iter_lines())
+    except LLMStreamError as error:
+        raise ModelCallError(f"流式响应无法解析：{error}") from error
+    if not reply.strip():
+        raise _EmptyReplyError()
+    return reply
+
+
+def _post_once(payload: dict[str, Any], timeout: int) -> ModelReply:
+    config = load_model_config()
+    base_url = str(config.get("base_url") or "")
+    api_key = str(config.get("api_key") or "")
+    model = str(payload.get("model") or "")
+    if not base_url or not model or not api_key:
+        raise ModelNotConfiguredError(
+            "模型未配置：请先在稽核平台「模型配置」页填写接入地址和 API Key"
+        )
+
+    # 请求形态全部由配置决定：认证头名称/前缀、对话路径、是否流式。
+    # 默认值与平台一直以来的行为一致（Authorization: Bearer + /chat/completions + 非流式）。
+    url = build_endpoint(base_url, config.get("chat_path"))
+    headers = build_auth_headers(config)
+    streaming = bool(config.get("stream"))
+    if streaming:
+        payload = {**payload, "stream": True}
+        headers["Accept"] = "text/event-stream"
+
+    # 附加请求参数 / 附加请求头：这是适配各厂商差异的通用出口，放在最后合并，
+    # 所以它能覆盖平台生成的任何字段（包括 max_tokens、thinking 等）
+    payload, headers = _merge_extra(dict(payload), headers, config)
+
+    started = time.perf_counter()
+    log_llm_request(url, headers, payload)
+    timer = start_timer()
+    try:
+        if streaming:
+            with httpx.stream(
+                "POST", url, headers=headers, json=payload, timeout=timeout
+            ) as response:
+                status = response.status_code
+                reply = _read_streaming(response)
+        else:
+            response = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+            status = response.status_code
+            reply = _read_blocking(response)
+        log_llm_response(status, timer.elapsed_ms, reply)
+    except httpx.TimeoutException as error:
+        log_llm_response(0, timer.elapsed_ms, f"超时：{error}")
+        raise ModelCallError(f"模型请求超时（上限 {timeout} 秒）：{error}") from error
+    except httpx.HTTPError as error:
+        log_llm_response(0, timer.elapsed_ms, f"连接失败：{error}")
+        raise ModelCallError(f"模型请求失败：{error}") from error
+    except (ModelCallError, _RateLimitedError, _EmptyReplyError) as error:
+        log_llm_response(0, timer.elapsed_ms, str(error))
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
 
     return ModelReply(text=reply, model=model, elapsed_ms=elapsed_ms)
 
@@ -201,16 +263,17 @@ def chat(prompt: str, *, max_tokens: int = 4096) -> ModelReply:
     timeout = _effective_timeout(
         config.get("timeout_seconds"), len(prompt), has_images=False
     )
-    return _post(
-        {
-            "model": model,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            **_model_thinking_controls(model),
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout,
-    )
+    body: dict[str, Any] = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    # 用户填了「附加请求参数」就完全以他写的为准，平台不再自动补思考参数，
+    # 免得偷偷塞一个 thinking:disabled 把用户的 enable_thinking 盖掉
+    if not parse_extra_body(config):
+        body.update(_thinking_controls(model))
+    return _post(body, timeout)
 
 
 def chat_with_images(
@@ -234,16 +297,15 @@ def chat_with_images(
         content.append(
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
         )
-    return _post(
-        {
-            "model": model,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            **_model_thinking_controls(model),
-            "messages": [{"role": "user", "content": content}],
-        },
-        timeout,
-    )
+    body: dict[str, Any] = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if not parse_extra_body(config):
+        body.update(_thinking_controls(model))
+    return _post(body, timeout)
 
 
 _FENCED_JSON_PATTERN = re.compile(r"```json\s*(.+?)\s*```", re.DOTALL)

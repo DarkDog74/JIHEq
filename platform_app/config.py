@@ -17,6 +17,24 @@ STAGING_ROOT = OUTPUT_ROOT / ".staging"
 DATABASE_PATH = STATE_ROOT / "platform.db"
 SECRETS_PATH = PROJECT_ROOT / "secrets.env"
 
+# 网页端「选择文件夹」的浏览根目录。
+# 服务器是无头环境，平台原有的原生弹窗（macOS 走 osascript、Linux 走 tkinter）
+# 在容器里必然失败——缺 libtk 且没有 $DISPLAY，即使装上 tk 也没显示器可弹。
+# 因此改成由后端列目录、网页自己渲染选择器。
+# 限定在这个根之下，避免网页上能遍历整台服务器的文件系统。
+BROWSE_ROOT = Path(
+    os.environ.get("AUDIT_BROWSE_ROOT", "/data")
+).expanduser().resolve()
+
+# 网页端上传的待稽核材料落在这里。
+# 用户在**自己的电脑上**用浏览器的文件夹选择框选目录，浏览器把每个文件连同
+# 相对路径传上来，后端按原目录结构还原到这个根目录之下，再把路径交给
+# 原有的校验/稽核流程。放在 OUTPUT_ROOT 的兄弟位置，保证挂载出来的
+# 卷里、容器重建也不丢。
+UPLOAD_ROOT = Path(
+    os.environ.get("AUDIT_UPLOAD_ROOT", OUTPUT_ROOT.parent / "上传")
+).expanduser().resolve()
+
 DEFAULT_LLM_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 DEFAULT_LLM_MODEL = "glm-5v-turbo"
 DEFAULT_LLM_PROMPT_VERSION = "audit-narration-v5"
@@ -35,6 +53,14 @@ class AISettings:
     max_tokens: int = 1024
     temperature: float = 0.2
     max_input_bytes: int = 32 * 1024
+    # 认证头名称与值前缀。这里写字面量而不是引用 model_config 里的常量：
+    # config 被 model_config 反向导入，模块级引用会成环。
+    auth_header: str = "Authorization"
+    auth_scheme: str = "Bearer"
+    # 各厂商差异的通用出口：用户填的原始 JSON 文本，直接合并进请求体/请求头。
+    # 非空时平台不再自动添加任何思考类参数，完全以用户写的为准。
+    extra_body: str = ""
+    extra_headers: str = ""
 
     @property
     def configured(self) -> bool:
@@ -127,21 +153,27 @@ def load_ai_settings(
     from .model_config import load_model_config
 
     model_config = load_model_config()
-    base_url = str(model_config.get("base_url") or "").rstrip("/")
-    endpoint = (
-        base_url
-        if base_url.endswith("/chat/completions")
-        else f"{base_url}/chat/completions"
+    # 端点由「接入地址 + 对话路径」拼成；对话路径留空表示接入地址本身就是完整端点
+    # （自建网关常见）。不再硬编码 /chat/completions。
+    from .model_config import build_endpoint
+
+    endpoint = build_endpoint(
+        model_config.get("base_url"), model_config.get("chat_path")
     )
     return AISettings(
         # 仅保留环境开关用于无代码运行期回滚；密钥和模型参数不再从环境读取。
         enabled=_as_bool(str(source_environment.get("AUDIT_LLM_ENABLED", "true")), True),
         api_key=str(model_config.get("api_key") or ""),
         endpoint=endpoint or DEFAULT_LLM_ENDPOINT,
+        auth_header=str(model_config.get("auth_header") or "Authorization"),
+        auth_scheme=str(model_config.get("auth_scheme") or ""),
         model=str(model_config.get("model") or DEFAULT_LLM_MODEL),
         timeout_seconds=float(model_config.get("timeout_seconds") or 120),
-        max_tokens=1024,
+        # 可配置：推理模型的思考也计入这个额度，1024 常常不够，思考吃满后正文为空
+        max_tokens=int(model_config.get("max_tokens") or 1024),
         temperature=0.2,
+        extra_body=str(model_config.get("extra_body") or ""),
+        extra_headers=str(model_config.get("extra_headers") or ""),
         # This limit is deliberately not configurable above the confirmed 32 KiB cap.
         max_input_bytes=32 * 1024,
     )
