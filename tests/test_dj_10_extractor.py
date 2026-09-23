@@ -78,7 +78,7 @@ class DJ10ExtractorTests(unittest.TestCase):
             reply = ModelReply(
                 text=json.dumps(
                     {
-                        "是否属于": True,
+                        "是否一致": True,
                         "匹配层级": "网络类型",
                         "网络类型": "互联网云服务平台",
                         "A类单元": None,

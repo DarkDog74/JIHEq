@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,72 @@ class ModelReply:
 _IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 _MAX_ERROR_DETAIL_CHARS = 240
 _GLM_53_FLASH = "glm-5.3-flash"
+_MAX_IMAGE_EDGE = 8192
+
+
+def _normalize_image(path: Path) -> tuple[Path, str, Path | None] | None:
+    """统一图片输入格式；转不出位图的附件返回 None（由调用方剔除）。
+
+    识别服务只可靠识别标准 JPEG/PNG；解析器从 Word/PDF 里抽出的图可能是
+    webp/tiff/bmp 等，而 data URL 的 mime 只能按后缀声明，字节流与声明
+    不符就会被网关以 InvalidParameter 拒收（HTTP 400）。这里把所有非常规
+    输入统一转成白底 RGB JPEG（长边超过 8192px 时等比缩小）；标准 RGB
+    JPEG 与常规 PNG（RGB/L/RGBA/P）原样发送不做二次编码。
+    EMF/WMF（无渲染器时只有文件头可读）、嵌入 Office 对象等转不出像素的
+    文件返回 None：发原字节识别服务同样解析不了，只会 400 并连累同批
+    正常图片。环境缺 Pillow 时维持旧行为原样发送。
+    返回 (发送路径, mime, 需清理的临时文件或 None)。
+    """
+    suffix = path.suffix.casefold()
+    try:
+        from PIL import Image
+    except ImportError:  # 环境缺 Pillow：维持旧行为
+        return path, _IMAGE_MIME.get(suffix, "image/png"), None
+
+    try:
+        with Image.open(path) as image:
+            image.load()  # EMF 等只有文件头可读的格式在这一步暴露无法渲染
+            if suffix in (".jpg", ".jpeg", ".png") and image.mode in (
+                "RGB",
+                "L",
+                "RGBA",
+                "P",
+            ):
+                mime = _IMAGE_MIME[suffix]
+                return path, mime, None
+            if image.mode == "RGB":
+                work = image
+            else:
+                # 统一铺白底压平透明通道；CMYK/16bit 等经 RGBA 转 RGB
+                rgba = image.convert("RGBA")
+                work = Image.new("RGB", rgba.size, (255, 255, 255))
+                work.paste(rgba, mask=rgba.getchannel("A"))
+            if max(work.size) > _MAX_IMAGE_EDGE:
+                scale = _MAX_IMAGE_EDGE / max(work.size)
+                work = work.resize(
+                    (
+                        max(1, round(work.width * scale)),
+                        max(1, round(work.height * scale)),
+                    )
+                )
+    except Exception:
+        # 损坏文件、EMF/嵌入对象等转不出位图：剔除，不发送原字节
+        return None
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="jihe-img-", suffix=".jpg", delete=False
+    )
+    handle.close()
+    try:
+        work.save(handle.name, format="JPEG", quality=92)
+    except Exception:
+        try:
+            handle_path = Path(handle.name)
+            handle_path.unlink()
+        except OSError:
+            pass
+        return None
+    return Path(handle.name), "image/jpeg", Path(handle.name)
 
 
 def _thinking_controls(model: str) -> dict[str, Any]:
@@ -288,24 +355,48 @@ def chat_with_images(
         config.get("timeout_seconds"), len(prompt), has_images=True
     )
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for raw_path in image_paths:
-        path = Path(raw_path)
-        if not path.is_file():
-            raise ModelCallError(f"图片文件不存在：{path}")
-        mime = _IMAGE_MIME.get(path.suffix.casefold(), "image/png")
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        content.append(
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
-        )
-    body: dict[str, Any] = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if not parse_extra_body(config):
-        body.update(_thinking_controls(model))
-    return _post(body, timeout)
+    temp_files: list[Path] = []
+    skipped: list[str] = []
+    try:
+        for raw_path in image_paths:
+            path = Path(raw_path)
+            if not path.is_file():
+                raise ModelCallError(f"图片文件不存在：{path}")
+            prepared = _normalize_image(path)
+            if prepared is None:
+                # EMF、嵌入 Office 对象等渲染不出位图的附件：剔除不发送，
+                # 否则识别服务 400 会连累同批正常图片。
+                skipped.append(path.name)
+                continue
+            send_path, mime, temp = prepared
+            if temp is not None:
+                temp_files.append(temp)
+            encoded = base64.b64encode(send_path.read_bytes()).decode("ascii")
+            content.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+            )
+        if skipped:
+            note = "、".join(skipped)
+            if len(skipped) == len(list(image_paths)):
+                raise ModelCallError(
+                    f"没有可识别的图片：全部 {len(skipped)} 个附件都无法渲染为位图（{note}）"
+                )
+            print(f"[LLM] 已剔除无法渲染为位图的图片附件：{note}")
+        body: dict[str, Any] = {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if not parse_extra_body(config):
+            body.update(_thinking_controls(model))
+        return _post(body, timeout)
+    finally:
+        for temp in temp_files:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
 
 
 _FENCED_JSON_PATTERN = re.compile(r"```json\s*(.+?)\s*```", re.DOTALL)

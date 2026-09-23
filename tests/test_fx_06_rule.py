@@ -12,11 +12,20 @@ from audit_rules.topology_support import build_topology_prompt
 import audit_rules.fx_06 as rule_mod
 
 
-def _topology_reply(nodes: list[dict], confidence: float = 0.9) -> ModelReply:
+def _topology_reply(
+    nodes: list[dict],
+    confidence: float = 0.9,
+    clear: bool | None = True,
+) -> ModelReply:
+    payload: dict = {
+        "节点": nodes,
+        "识别说明": "",
+        "置信度": confidence,
+    }
+    if clear is not None:
+        payload["拓扑图清晰"] = clear
     return ModelReply(
-        text=json.dumps(
-            {"节点": nodes, "识别说明": "", "置信度": confidence}, ensure_ascii=False
-        ),
+        text=json.dumps(payload, ensure_ascii=False),
         model="fake",
         elapsed_ms=5,
     )
@@ -105,8 +114,34 @@ class FX06RuleTests(unittest.TestCase):
         self.assertEqual(result["模型识别IP"], ["10.0.0.1"])
         self.assertNotIn("模型识别名称", result)
 
+    def test_unclear_topology_fails_with_fixed_reason(self) -> None:
+        # 判定口径（2026-09 更新）：不清晰直接不通过，理由固定，
+        # 即使模型仍提取到 IP 也不进入 IP 核对。
+        reply = _topology_reply(
+            [{"名称": "防火墙", "IP": "10.0.0.1", "类型": "防火墙"}],
+            clear=False,
+        )
+        with patch.object(topology_support, "_chat_with_images", return_value=reply):
+            result = rule_mod.audit_fx_06(FIELDS)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["message"], "拓扑图不清晰，无法判定")
+        self.assertIn("拓扑图不清晰", result["issues"][0])
+        self.assertEqual(result["模型判断拓扑图清晰"], False)
+        self.assertNotIn("模型识别IP", result)
+
+    def test_missing_clarity_answer_fails(self) -> None:
+        # 模型没回答“拓扑图清晰”：无法证明清晰，按不通过处理。
+        reply = _topology_reply(
+            [{"名称": "防火墙", "IP": "10.0.0.1", "类型": "防火墙"}],
+            clear=None,
+        )
+        with patch.object(topology_support, "_chat_with_images", return_value=reply):
+            result = rule_mod.audit_fx_06(FIELDS)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["message"], "拓扑图不清晰，无法判定")
+
     def test_names_without_ip_fails(self) -> None:
-        # 没提取到任何 IP → 直接不通过（名称不算数）
+        # 图清晰但没提取到任何 IP → 不通过（名称不算数）
         reply = _topology_reply([{"名称": "核心交换", "IP": None, "类型": "交换机"}])
         with patch.object(topology_support, "_chat_with_images", return_value=reply):
             result = rule_mod.audit_fx_06(FIELDS)

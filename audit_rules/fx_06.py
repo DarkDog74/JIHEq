@@ -9,6 +9,7 @@ from .model_support import (
     failed_result,
     passed_result,
     resolve_staged_image,
+    topology_is_clear,
 )
 from .registry import register_rule
 from .topology_support import (
@@ -87,11 +88,31 @@ def audit_fx_06(fields: Mapping[str, Any]) -> dict[str, Any]:
 
     detail = {
         "拓扑图数量": len(image_paths),
+        "模型判断拓扑图清晰": payload.get("拓扑图清晰"),
         "模型识别说明": payload.get("识别说明"),
     }
 
-    # 判定口径（2026-08-26 定稿）：只看 IP，不做名称匹配——
-    # 模型未提取到任何 IP 直接不通过；提取到了由代码逐个到资产清单核对。
+    # 判定口径（2026-09 更新）：先判清晰度，再核对 IP——
+    # 模型未明确回答“拓扑图清晰”=true（不清晰或没回答）一律不通过，
+    # 理由固定为“拓扑图不清晰，无法判定”；清晰时才继续 IP 核对。
+    if not topology_is_clear(payload):
+        return failed_result(
+            "FX-06",
+            [
+                "拓扑图不清晰，无法判定"
+                + (
+                    f"（{payload.get('识别说明')}）"
+                    if str(payload.get("识别说明") or "").strip()
+                    else ""
+                )
+            ],
+            "拓扑图不清晰，无法判定",
+            call_records=records,
+            **detail,
+        )
+
+    # IP 核对（2026-08-26 定稿）：只看 IP，不做名称匹配——
+    # 没提取到任何 IP 直接不通过；提取到了由代码逐个到资产清单核对。
     ips = extract_node_ips(payload)
     asset_ips = set(fields.get("资产IP清单") or [])
 
@@ -99,8 +120,8 @@ def audit_fx_06(fields: Mapping[str, Any]) -> dict[str, Any]:
         return failed_result(
             "FX-06",
             [
-                f"模型未能从拓扑图提取到任何 IP"
-                f"（{payload.get('识别说明') or '图可能模糊'}）"
+                f"拓扑图清晰但未提取到任何 IP"
+                f"（{payload.get('识别说明') or '图中无 IP 标注'}）"
             ],
             "风险评估报告拓扑图未提取到 IP，无法确认与资产清单一致",
             call_records=records,

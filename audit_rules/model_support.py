@@ -264,12 +264,19 @@ def not_applicable_result(item_id: str, message: str) -> dict[str, Any]:
 TOPOLOGY_PROMPT_TEMPLATE = (
     "这是某通信系统的网络拓扑图（共 {count} 张，按顺序给出）。请逐张识别图中的全部内容。\n"
     "只输出一个 JSON 对象，不要输出任何其他文字，结构如下：\n"
-    '{"节点": [{"名称": "<图中文字>", "IP": "<图中标注IP，没有则null>", '
+    '{"拓扑图清晰": <true或false：全部图片都清晰可辨认才为true，任一张模糊、'
+    '无法辨认内容即为false>, '
+    '"节点": [{"名称": "<图中文字>", "IP": "<图中标注IP，没有则null>", '
     '"类型": "<防火墙/交换机/服务器/安全设备/未知>"}], '
     '"识别说明": "<清晰度与看不清的内容，30字以内>", '
     '"分析说明": "<第一人称概括识别证据，80字以内>"}\n'
     "注意：逐字抄录图中标注，不要推测补全；看不清的内容写进\"识别说明\"，不要编造，不要展开描述。"
 )
+
+
+def topology_is_clear(payload: Mapping[str, Any]) -> bool:
+    """读取模型返回的“拓扑图清晰”布尔；未明确回答 true 一律视为不清晰。"""
+    return payload.get("拓扑图清晰") is True
 
 
 def topology_prompt(image_count: int) -> str:

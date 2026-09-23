@@ -31,7 +31,7 @@ def _classification(
     basis: str = "概述中的功能与候选路径一致",
 ) -> dict:
     return {
-        "是否属于": belongs,
+        "是否一致": belongs,
         "匹配层级": level,
         "网络类型": network_type,
         "A类单元": a_unit,
@@ -108,7 +108,7 @@ class DJ10RuleTests(unittest.TestCase):
             result = rule_mod.audit_dj_10(FIELDS)
         self.assertFalse(result["passed"])
         self.assertNotIn("applicable", result)
-        self.assertIn("不属于", result["message"])
+        self.assertIn("不一致", result["message"])
 
     def test_false_conclusion_is_not_overridden_by_a_valid_path(self) -> None:
         reply = _reply(
@@ -181,7 +181,7 @@ class DJ10RuleTests(unittest.TestCase):
 
     def test_membership_must_be_a_json_boolean(self) -> None:
         payload = _classification(belongs=False)
-        payload["是否属于"] = "false"
+        payload["是否一致"] = "false"
         with patch.object(rule_mod, "_chat", return_value=_reply(payload)):
             result = rule_mod.audit_dj_10(FIELDS)
         self.assertFalse(result["passed"])
@@ -193,11 +193,11 @@ class DJ10RuleTests(unittest.TestCase):
             level="网络类型",
             network_type="互联网云服务平台",
         )
-        del payload["是否属于"]
+        del payload["是否一致"]
         with patch.object(rule_mod, "_chat", return_value=_reply(payload)):
             result = rule_mod.audit_dj_10(FIELDS)
         self.assertFalse(result["passed"])
-        self.assertIn("是否属于", result["issues"][0])
+        self.assertIn("是否一致", result["issues"][0])
 
     def test_model_error_fails_with_records_kept(self) -> None:
         with patch.object(
@@ -237,7 +237,7 @@ class DJ10RuleTests(unittest.TestCase):
         self.assertIn(FIELDS["系统概述"], prompt)
         self.assertIn("系统类型划分", prompt)
         for schema_field in (
-            "是否属于",
+            "是否一致",
             "匹配层级",
             "网络类型",
             "A类单元",
