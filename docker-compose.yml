@@ -8,6 +8,10 @@ services:
     environment:
       AUDIT_HOST: 0.0.0.0
       AUDIT_PORT: "8765"
+      # HTTPS 反向代理部署时设置公开源；例如 https://audit.example.com
+      AUDIT_PUBLIC_ORIGIN: ${AUDIT_PUBLIC_ORIGIN:-}
+      AUDIT_COOKIE_SECURE: ${AUDIT_COOKIE_SECURE:-true}
+      AUDIT_URL_PREFIX: ${AUDIT_URL_PREFIX:-/chuilei/jihe}
       AUDIT_PLATFORM_OUTPUT: /app/output/单系统
       # 若 MinerU 跑在宿主机上，把 config/paths.json 的 mineru_url
       # 改成 http://host.docker.internal:18001/file_parse

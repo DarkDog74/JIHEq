@@ -17,6 +17,11 @@ import type {
   SourcePreview,
 } from './types'
 
+const props = defineProps<{ user: { id: string; username: string; role: string }; csrfToken: string }>()
+const emit = defineEmits<{ logout: []; unauthorized: [] }>()
+const lifecycle = new AbortController()
+const jobStorageKey = `audit-current-job:${props.user.id}`
+
 type View = 'home' | 'running' | 'results' | 'settings'
 type LiveAiStatus = 'pending' | 'streaming' | 'completed' | 'failed' | 'skipped' | 'program'
 type LiveItemKind = 'pending' | 'ai' | 'program'
@@ -236,15 +241,18 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   // 上传文件时 body 是 File/Blob，必须让浏览器自己决定 Content-Type，
   // 硬设成 application/json 会把二进制内容发坏。
   const isBinary = init?.body instanceof FormData || init?.body instanceof Blob
-  const headers = isBinary
-    ? init?.headers
-    : { 'Content-Type': 'application/json', ...(init?.headers as Record<string, string> | undefined) }
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  const headers = new Headers(init?.headers)
+  if (!isBinary) headers.set('Content-Type', 'application/json')
+  if (init?.method && !['GET', 'HEAD'].includes(init.method.toUpperCase())) headers.set('X-CSRF-Token', props.csrfToken)
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: 'same-origin', signal: lifecycle.signal })
+  if (response.status === 401) emit('unauthorized')
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: `请求失败：${response.status}` }))
     throw new Error(payload.detail || '请求失败')
   }
-  return response.json()
+  const payload = await response.json()
+  if (lifecycle.signal.aborted) throw new Error('页面已关闭')
+  return payload
 }
 
 async function loadRecent() {
@@ -257,6 +265,7 @@ async function loadHealth() {
 }
 
 async function enterSettings() {
+  if (props.user.role !== 'admin') return
   settingsError.value = ''
   settingsSaved.value = false
   modelTest.value = null
@@ -496,7 +505,7 @@ async function enterPendingResults(systemId: string) {
   if (loadingPendingResult || !systemId) return
   loadingPendingResult = true
   events?.close()
-  localStorage.removeItem('audit-current-job')
+  localStorage.removeItem(jobStorageKey)
   try {
     await loadSummary(systemId)
     pendingResultSystemId = ''
@@ -791,7 +800,7 @@ async function startJob() {
     job.value = await api<Job>('/api/jobs', {
       method: 'POST', body: JSON.stringify({ source_path: preview.value.source_path }),
     })
-    localStorage.setItem('audit-current-job', job.value.id)
+    localStorage.setItem(jobStorageKey, job.value.id)
     view.value = 'running'
     connectEvents(job.value.id)
     startPolling(job.value.id)
@@ -815,6 +824,7 @@ function connectEvents(jobId: string) {
     events.addEventListener(eventType, event => receiveEvent(event as MessageEvent, eventType))
   }
   events.addEventListener('end', markSseEnded)
+  events.addEventListener('auth_expired', () => { events?.close(); emit('unauthorized') })
   events.onerror = () => {
     streamDisconnected = true
     if (pendingResultSystemId) scheduleStreamFallback()
@@ -833,7 +843,7 @@ function startPolling(jobId: string) {
         if (completedJobStatuses.has(job.value.status)) markCompletedJob(job.value.system_id)
         else {
           events?.close()
-          localStorage.removeItem('audit-current-job')
+          localStorage.removeItem(jobStorageKey)
         }
       }
     } catch { /* transient polling failure */ }
@@ -846,12 +856,12 @@ async function resumeJob(jobId: string) {
     const existing = await api<Job>(`/api/jobs/${jobId}`)
     job.value = existing
     if (terminalStatuses.has(existing.status)) {
-      localStorage.removeItem('audit-current-job')
+      localStorage.removeItem(jobStorageKey)
       if (existing.status.startsWith('completed')) await loadSummary(existing.system_id)
       return
     }
     view.value = 'running'; connectEvents(jobId); startPolling(jobId)
-  } catch { localStorage.removeItem('audit-current-job') }
+  } catch { localStorage.removeItem(jobStorageKey) }
 }
 
 async function cancelJob() {
@@ -954,10 +964,11 @@ onMounted(async () => {
   motionPreference.addEventListener('change', updateMotionPreference)
   await Promise.all([loadRecent(), loadHealth()])
   animate('.brand-lockup', { opacity: [0, 1], x: [-18, 0] }, { duration: .7 })
-  const current = localStorage.getItem('audit-current-job'); if (current) await resumeJob(current)
+  const current = localStorage.getItem(jobStorageKey); if (current) await resumeJob(current)
   window.addEventListener('resize', renderChart)
 })
 onBeforeUnmount(() => {
+  lifecycle.abort()
   events?.close()
   if (pollTimer) window.clearInterval(pollTimer)
   clearAiTimers()
@@ -977,7 +988,8 @@ onBeforeUnmount(() => {
         <span class="brand-mark"><b></b><i></i></span>
         <span><strong>浙江移动-定级备案报告稽核系统</strong></span>
       </button>
-      <button v-if="view !== 'running' && view !== 'settings'" class="header-link-btn" @click="enterSettings">模型配置</button>
+      <button v-if="user.role === 'admin' && view !== 'running' && view !== 'settings'" class="header-link-btn" @click="enterSettings">模型配置</button>
+      <span class="account-name">{{ user.username }}</span><button class="header-link-btn" @click="emit('logout')">退出登录</button>
       <div class="header-status"><span class="live-dot"></span><b>{{ auditItemCount || '—' }}</b><small>稽核项在线</small></div>
     </header>
 

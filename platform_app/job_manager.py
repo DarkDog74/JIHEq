@@ -20,8 +20,8 @@ from .events import append_event, event_path
 ACTIVE_STATUSES = {"queued", "running", "cancelling"}
 
 
-def system_id_for(source: Path) -> str:
-    return hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()[:12]
+def system_id_for(source: Path, owner_user_id: str | None = None) -> str:
+    return hashlib.sha256((f"{owner_user_id}:" + str(source.resolve()) if owner_user_id else str(source.resolve())).encode("utf-8")).hexdigest()[:12]
 
 
 def safe_output_name(name: str, system_id: str) -> str:
@@ -136,11 +136,12 @@ class JobManager:
             return job
         return job
 
-    def describe_source(self, source_path: str) -> dict[str, object]:
+    def describe_source(self, source_path: str, *, owner_user_id: str | None = None) -> dict[str, object]:
         preview = preview_source(Path(source_path))
         source = Path(str(preview["source_path"]))
-        system_id = system_id_for(source)
-        output_dir = OUTPUT_ROOT / safe_output_name(source.name, system_id)
+        system_id = system_id_for(source, owner_user_id)
+        output_root = OUTPUT_ROOT / "users" / owner_user_id if owner_user_id else OUTPUT_ROOT
+        output_dir = output_root / safe_output_name(source.name, system_id)
         existing = self.db.get_system(system_id)
         return {
             **preview,
@@ -149,11 +150,11 @@ class JobManager:
             "has_previous_result": bool(existing and (output_dir / "summary.json").is_file()),
         }
 
-    def create_job(self, source_path: str) -> dict[str, object]:
+    def create_job(self, source_path: str, *, owner_user_id: str | None = None) -> dict[str, object]:
         active = self.db.get_active_job()
         if active:
-            raise RuntimeError(f"当前已有任务正在执行：{active['id']}")
-        descriptor = self.describe_source(source_path)
+            raise RuntimeError("当前服务正在处理任务，请稍后重试")
+        descriptor = self.describe_source(source_path, owner_user_id=owner_user_id)
         source = Path(str(descriptor["source_path"]))
         system_id = str(descriptor["system_id"])
         output_dir = Path(str(descriptor["output_dir"]))
@@ -163,6 +164,7 @@ class JobManager:
             display_name=source.name,
             department=source.parent.name,
             output_dir=str(output_dir),
+            owner_user_id=owner_user_id,
         )
         job_id = uuid.uuid4().hex
         events = event_path(job_id)
@@ -172,6 +174,7 @@ class JobManager:
         job = self.db.create_job(
             {
                 "id": job_id,
+                "owner_user_id": owner_user_id,
                 "system_id": system_id,
                 "source_path": str(source),
                 "status": "queued",
@@ -188,7 +191,7 @@ class JobManager:
             "--job-id",
             job_id,
             "--database",
-            str(DATABASE_PATH),
+            str(self.db.path),
         ]
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(PROJECT_ROOT)

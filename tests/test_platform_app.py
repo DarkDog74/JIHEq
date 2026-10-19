@@ -59,7 +59,8 @@ class PlatformAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run.return_value = CompletedProcess([], 0, stdout=f"{temporary}\n", stderr="")
 
-            selected = choose_system_folder()
+            with patch("platform_app.folder_picker.sys.platform", "darwin"):
+                selected = choose_system_folder()
 
             self.assertEqual(selected, Path(temporary).resolve())
             self.assertEqual(run.call_args.args[0][0], "/usr/bin/osascript")
@@ -546,6 +547,7 @@ class PlatformAppTests(unittest.TestCase):
             with (
                 patch.object(api, "db", terminal_db),
                 patch.object(api, "event_path", return_value=target),
+                patch.object(api.jobs, "get_job", side_effect=terminal_db.get_job),
             ):
                 streamed = asyncio.run(consume())
 
@@ -570,8 +572,7 @@ class PlatformAppTests(unittest.TestCase):
         ):
             payload = api.health()
 
-        self.assertTrue(payload["ai"]["configured"])
-        self.assertNotIn("api_key", payload["ai"])
+        self.assertNotIn("ai", payload)
         self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
 
     def test_frontend_index_is_never_cached_across_upgrades(self) -> None:

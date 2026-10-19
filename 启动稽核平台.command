@@ -10,6 +10,11 @@ APP_REQUIREMENTS="$PROJECT_DIR/requirements.txt"
 PARSER_REQUIREMENTS="$PARSER_DIR/requirements.txt"
 HOST="${AUDIT_HOST:-127.0.0.1}"
 PORT="${AUDIT_PORT:-8765}"
+export AUDIT_URL_PREFIX="${AUDIT_URL_PREFIX-/chuilei/jihe}"
+# 本机 HTTP 启动允许普通 Cookie；服务器 HTTPS 部署应保持 Secure 默认值。
+if [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]]; then
+  export AUDIT_COOKIE_SECURE="${AUDIT_COOKIE_SECURE:-false}"
+fi
 URL="http://$HOST:$PORT"
 BREW_BIN=""
 PYTHON_BIN=""

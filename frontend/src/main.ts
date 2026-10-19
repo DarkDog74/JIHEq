@@ -1,5 +1,5 @@
 import { createApp } from 'vue'
-import App from './App.vue'
+import App from './AuthShell.vue'
 import './styles.css'
 import './overrides.css'
 import './light-theme.css'

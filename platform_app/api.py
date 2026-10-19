@@ -3,18 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
+import time
 from pathlib import Path, PurePosixPath
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .audit_service import normalize_audit_summary, paired_item_ids
-from .config import BROWSE_ROOT, PROJECT_ROOT, UPLOAD_ROOT, ai_config_status
+from .config import PROJECT_ROOT, UPLOAD_ROOT, ai_config_status
 from .database import Database
 from .events import event_path
-from .folder_picker import FolderPickerError, choose_system_folder
 from .job_manager import JobManager
 from .model_config import (
     DEFAULT_MODEL,
@@ -24,6 +25,8 @@ from .model_config import (
     save_model_config,
 )
 from .report import generate_report
+from .auth import (AuthMiddleware, COOKIE_NAME, checked_source, current_user,
+                   public_user, token_hash, user_upload_root, verify_password)
 
 
 class SourceRequest(BaseModel):
@@ -88,9 +91,57 @@ class _UrlPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
-app = FastAPI(title="浙江移动-定级备案报告稽核系统", version="1.0.0")
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, title="浙江移动-定级备案报告稽核系统", version="1.0.0")
+app.add_middleware(AuthMiddleware, database=lambda: db)
 if _URL_PREFIX:
     app.add_middleware(_UrlPrefixMiddleware)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, request: Request, response: Response):
+    if "application/json" not in request.headers.get("content-type", ""):
+        raise HTTPException(415, "请使用JSON登录")
+    if len(payload.username) > 64 or len(payload.password) > 256:
+        raise HTTPException(401, "账号或密码错误")
+    address = request.client.host if request.client else "unknown"
+    if not db.allow_login_attempt("ip:" + token_hash(address), 50) or not db.allow_login_attempt(
+        "account:" + token_hash(payload.username.strip().casefold()), 10
+    ):
+        raise HTTPException(429, "登录尝试过多，请15分钟后重试")
+    user = db.get_user(payload.username)
+    valid = verify_password(str(user["password_hash"]) if user else "", payload.password)
+    if not valid or not user or not user["enabled"]:
+        raise HTTPException(401, "账号或密码错误")
+    db.delete_session(token_hash(request.cookies.get(COOKIE_NAME, "")))
+    token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    ttl = max(60, int(os.environ.get("AUDIT_SESSION_SECONDS", "28800")))
+    try:
+        db.new_session(token_hash(token), str(user["id"]), csrf, time.time() + ttl,
+                       expected_password_hash=str(user["password_hash"]))
+    except ValueError as error:
+        raise HTTPException(401, str(error)) from error
+    response.set_cookie(COOKIE_NAME, token, max_age=ttl, httponly=True,
+                        secure=os.environ.get("AUDIT_COOKIE_SECURE", "true").lower() != "false",
+                        samesite="strict", path=(_URL_PREFIX + "/") or "/")
+    return {"user": public_user(user), "csrf_token": csrf}
+
+
+@app.get("/api/auth/me")
+def me(request: Request):
+    return {"user": public_user(current_user(request)), "csrf_token": request.state.session["csrf_token"]}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    db.delete_session(token_hash(request.cookies.get(COOKIE_NAME, "")))
+    response.delete_cookie(COOKIE_NAME, path=(_URL_PREFIX + "/") or "/")
+    return {"ok": True}
+
 
 
 def _job_or_404(job_id: str) -> dict[str, object]:
@@ -111,25 +162,7 @@ def _system_or_404(system_id: str) -> dict[str, object]:
 
 @app.get("/api/health")
 def health() -> dict[str, object]:
-    status = ai_config_status()
-    public_ai = {
-        key: status[key]
-        for key in (
-            "enabled",
-            "configured",
-            "available",
-            "model",
-            "endpoint_host",
-            "prompt_version",
-            "max_input_bytes",
-        )
-        if key in status
-    }
-    return {
-        "ok": True,
-        "audit_item_count": len(paired_item_ids()),
-        "ai": public_ai,
-    }
+    return {"ok": True, "audit_item_count": len(paired_item_ids())}
 
 
 @app.get("/api/model-config")
@@ -156,31 +189,27 @@ def test_model_config_endpoint(request: ModelConfigRequest) -> dict[str, object]
 
 
 @app.post("/api/systems/validate")
-def validate_system(request: SourceRequest) -> dict[str, object]:
+def validate_system(request: SourceRequest, user: dict = Depends(current_user)) -> dict[str, object]:
     try:
-        return jobs.describe_source(request.source_path)
+        return jobs.describe_source(str(checked_source(request.source_path, user, UPLOAD_ROOT)), owner_user_id=str(user["id"]))
     except (FileNotFoundError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.post("/api/systems/select-folder")
 def select_system_folder() -> dict[str, object]:
-    try:
-        selected = choose_system_folder()
-    except FolderPickerError as error:
-        raise HTTPException(status_code=500, detail=str(error)) from error
-    return {"cancelled": selected is None, "source_path": str(selected) if selected else None}
+    raise HTTPException(403, "请使用浏览器上传自己的材料文件夹")
 
 
 @app.get("/api/systems/browse")
-def browse_system_folders(path: str = "") -> dict[str, object]:
+def browse_system_folders(path: str = "", user: dict = Depends(current_user)) -> dict[str, object]:
     """列出 BROWSE_ROOT 之下的子目录，供网页端的文件夹选择器使用。
 
     原生弹窗那条路在容器里走不通（见 folder_picker 里的说明），所以网页端
     自己列目录。只允许在 BROWSE_ROOT 之内浏览：请求路径先 resolve 再判断是否
     仍在根之下，这样 "../" 和指向外部的符号链接都绕不出去。
     """
-    root = BROWSE_ROOT
+    root = user_upload_root(user, UPLOAD_ROOT)
     if not root.is_dir():
         return {
             "ok": False,
@@ -213,7 +242,7 @@ def browse_system_folders(path: str = "") -> dict[str, object]:
             (
                 child
                 for child in target.iterdir()
-                if child.is_dir() and not child.name.startswith(".")
+                if child.is_dir() and not child.name.startswith(".") and child.resolve().is_relative_to(root)
             ),
             key=lambda child: child.name,
         )
@@ -244,13 +273,13 @@ def _upload_folder_name(folder: str) -> str:
     return name
 
 
-def _upload_target(folder: str) -> tuple[Path, str]:
+def _upload_target(folder: str, user: dict) -> tuple[Path, str]:
     """解析成 UPLOAD_ROOT 下的目标目录，返回 (目录, 目录名)。
 
     解析后再确认仍在 UPLOAD_ROOT 之内，防止写到卷外面去。
     """
     name = _upload_folder_name(folder)
-    root = UPLOAD_ROOT
+    root = user_upload_root(user, UPLOAD_ROOT)
     root.mkdir(parents=True, exist_ok=True)
     target = (root / name).resolve()
     if not target.is_relative_to(root):
@@ -296,6 +325,7 @@ async def upload_system_file(
     request: Request,
     folder: str = Query(...),
     relative_path: str = Query(...),
+    user: dict = Depends(current_user),
 ) -> dict[str, object]:
     """接收网页端上传的单个文件，按原目录结构落到 UPLOAD_ROOT 之下。
 
@@ -308,7 +338,7 @@ async def upload_system_file(
     原始体还能边收边写盘，大文件不用整个读进内存。
     目录名和相对路径放在查询参数里。
     """
-    target, folder_name = _upload_target(folder)
+    target, folder_name = _upload_target(folder, user)
     relative = _strip_root_segment(_upload_relative_path(relative_path), folder_name)
     destination = target / relative
 
@@ -334,9 +364,10 @@ class UploadFinishRequest(BaseModel):
 
 
 @app.post("/api/systems/upload/finish")
-def finish_upload(request: UploadFinishRequest) -> dict[str, object]:
+def finish_upload(request: UploadFinishRequest, user: dict = Depends(current_user)) -> dict[str, object]:
     """上传结束：返回可直接交给稽核流程的服务器路径。"""
-    target, _ = _upload_target(request.folder)
+    target, _ = _upload_target(request.folder, user)
+    checked_source(str(target), user, UPLOAD_ROOT)
     files = [path for path in target.rglob("*") if path.is_file()]
     if not files:
         raise HTTPException(status_code=400, detail="没有收到任何文件")
@@ -349,14 +380,14 @@ def finish_upload(request: UploadFinishRequest) -> dict[str, object]:
 
 
 @app.get("/api/systems")
-def recent_systems() -> list[dict[str, object]]:
-    return db.list_systems()
+def recent_systems(user: dict = Depends(current_user)) -> list[dict[str, object]]:
+    return db.list_systems(owner_user_id=str(user["id"]))
 
 
 @app.post("/api/jobs", status_code=202)
-def create_job(request: SourceRequest) -> dict[str, object]:
+def create_job(request: SourceRequest, user: dict = Depends(current_user)) -> dict[str, object]:
     try:
-        return jobs.create_job(request.source_path)
+        return jobs.create_job(str(checked_source(request.source_path, user, UPLOAD_ROOT)), owner_user_id=str(user["id"]))
     except (FileNotFoundError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except RuntimeError as error:
@@ -418,6 +449,7 @@ def _read_event_records(target: Path, offset: int) -> tuple[int, list[tuple[int,
 async def stream_events(
     job_id: str,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    request: Request = None,
 ) -> StreamingResponse:
     _job_or_404(job_id)
     target = event_path(job_id)
@@ -426,6 +458,9 @@ async def stream_events(
         offset = _parse_last_event_id(last_event_id)
         idle = 0
         while True:
+            if request is not None and not db.get_session(token_hash(request.cookies.get(COOKIE_NAME, ""))):
+                yield 'event: auth_expired\ndata: {}\n\n'
+                break
             offset, records = _read_event_records(target, offset)
             for event_offset, line in records:
                 offset = event_offset
@@ -536,6 +571,8 @@ if (FRONTEND_DIST / "assets").is_dir():
 
 @app.get("/{path:path}", include_in_schema=False)
 def frontend(path: str = ""):
+    if path == "api" or path.startswith("api/"):
+        raise HTTPException(404, "接口不存在")
     index = FRONTEND_DIST / "index.html"
     if index.is_file():
         # The JavaScript bundle is content-hashed, but index.html selects which hash

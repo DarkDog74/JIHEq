@@ -38,3 +38,5 @@ requests>=2.31,<3
 cryptography>=42.0
 colorlog>=6.7
 tqdm>=4.66
+
+argon2-cffi>=23.1,<26

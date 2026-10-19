@@ -1,6 +1,12 @@
 import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
 
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/auth/me', route => route.fulfill({ json: {
+    user: { id: 'test-user', username: 'tester', role: 'admin' }, csrf_token: 'test-csrf',
+  } }))
+})
+
 function sseEvent(id: number, payload: Record<string, unknown>) {
   return `id: ${id}\ndata: ${JSON.stringify(payload)}\n\n`
 }
@@ -18,7 +24,7 @@ function completedSummary(systemId: string) {
 }
 
 async function openRunningJob(page: Page, jobId: string, sseBody: string, auditCount = 34) {
-  await page.addInitScript(id => localStorage.setItem('audit-current-job', id), jobId)
+  await page.addInitScript(id => localStorage.setItem('audit-current-job:test-user', id), jobId)
   await page.route('**/api/health', route => route.fulfill({ json: { ok: true, audit_item_count: auditCount } }))
   await page.route('**/api/systems', route => route.fulfill({ json: [] }))
   await page.route(`**/api/jobs/${jobId}/events`, route => route.fulfill({
@@ -115,11 +121,11 @@ test('allows one configurable model for both text and image tasks', async ({ pag
   await expect(page.getByLabel('统一模型')).toHaveValue('glm-5.3-flash')
   await page.getByRole('button', { name: '测试连接' }).click()
   await expect(page.getByText('连接成功')).toBeVisible()
-  await expect(page.getByText('OK')).toBeVisible()
+  await expect(page.getByText('OK', { exact: true })).toBeVisible()
 })
 
 test('shows extracted fields in the result column and detail drawer', async ({ page }) => {
-  await page.addInitScript(() => localStorage.setItem('audit-current-job', 'job-1'))
+  await page.addInitScript(() => localStorage.setItem('audit-current-job:test-user', 'job-1'))
   await page.route('**/api/systems', route => route.fulfill({ json: [] }))
   await page.route('**/api/jobs/job-1', route => route.fulfill({ json: {
     id: 'job-1', system_id: 'system-1', source_path: '/tmp/测试系统-2', status: 'completed',
@@ -174,7 +180,7 @@ test('shows extracted fields in the result column and detail drawer', async ({ p
 
 test('keeps the left progress card while removing terminal rows', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
-  await page.addInitScript(() => localStorage.setItem('audit-current-job', 'job-log'))
+  await page.addInitScript(() => localStorage.setItem('audit-current-job:test-user', 'job-log'))
   await page.route('**/api/health', route => route.fulfill({ json: { ok: true, audit_item_count: 34 } }))
   await page.route('**/api/systems', route => route.fulfill({ json: [] }))
   await page.route('**/api/jobs/job-log/events', route => route.fulfill({
@@ -369,7 +375,7 @@ test('waits for SSE end and the visible AI queue before opening results', async 
   const systemId = 'system-ai-finish-gate'
   const text = '后端任务虽然已经完成，但当前的AI判定说明仍应逐字展示完整，然后才能进入结果页。'.repeat(2)
   let jobReads = 0
-  await page.addInitScript(id => localStorage.setItem('audit-current-job', id), jobId)
+  await page.addInitScript(id => localStorage.setItem('audit-current-job:test-user', id), jobId)
   await page.route('**/api/health', route => route.fulfill({ json: { ok: true, audit_item_count: 34 } }))
   await page.route('**/api/systems', route => route.fulfill({ json: [] }))
   await page.route(`**/api/jobs/${jobId}/events`, route => route.fulfill({
@@ -403,7 +409,7 @@ test('uses a bounded fallback after a completed job loses the SSE connection', a
   const jobId = 'job-ai-disconnected'
   const systemId = 'system-ai-disconnected'
   let jobReads = 0
-  await page.addInitScript(id => localStorage.setItem('audit-current-job', id), jobId)
+  await page.addInitScript(id => localStorage.setItem('audit-current-job:test-user', id), jobId)
   await page.route('**/api/health', route => route.fulfill({ json: { ok: true, audit_item_count: 34 } }))
   await page.route('**/api/systems', route => route.fulfill({ json: [] }))
   await page.route(`**/api/jobs/${jobId}/events`, route => route.fulfill({
